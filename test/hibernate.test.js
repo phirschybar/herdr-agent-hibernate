@@ -195,6 +195,14 @@ test("resume drops the entry when the agent is already back in the pane", () => 
   assert.deepEqual(t.registry(), {});
 });
 
+test("resume drops the entry when a different agent kind now occupies the pane", () => {
+  const t = setup({ agents: [agent({ agent: "codex", agent_session: { value: "other" } })] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "sess-1", slept_at: 1 } });
+  assert.equal(t.run("resume", "w1:p2").status, 0);
+  assert.ok(!t.herdr().calls.some((c) => c[1] === "start"));
+  assert.deepEqual(t.registry(), {});
+});
+
 test("sleep records the sleeper when herdr goes away after the signal but the pid is gone", async () => {
   const proc = fakeAgentProcess();
   await new Promise((r) => setTimeout(r, 200));

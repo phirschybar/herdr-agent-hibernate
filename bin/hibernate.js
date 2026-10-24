@@ -371,11 +371,15 @@ function resumePane(paneId) {
     if (!entry) return false;
     const kind = entryKind(entry);
 
-    const running = () => {
-      try { return agentInPane(paneId)?.kind === kind; } catch { return false; }
+    // Any agent in the pane ends the sleeper: a racing hook may have
+    // resumed it, or the user started something else there. Keeping the
+    // entry would retry a doomed `agent start` on every focus.
+    const occupant = () => {
+      try { return agentInPane(paneId); } catch { return null; }
     };
-    if (running()) {
-      log(`resume ${paneId}: ${kind} already running there; dropping sleeper entry`);
+    const there = occupant();
+    if (there) {
+      log(`resume ${paneId}: ${there.kind} already running there; dropping sleeper entry`);
       return true;
     }
 
@@ -397,7 +401,7 @@ function resumePane(paneId) {
       // agent_not_ready = launched but waiting on a startup dialog (trust
       // prompt, update notice). The user is looking at it; that's a resume.
       // Otherwise, if the agent is in the pane anyway, a racing hook won.
-      if (e.code === "agent_not_ready" || running()) {
+      if (e.code === "agent_not_ready" || occupant()) {
         log(`resume ${paneId}: ${kind} started (${e.code || "raced"})`);
         return true;
       }
