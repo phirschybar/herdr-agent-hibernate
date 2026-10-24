@@ -112,12 +112,23 @@ function log(msg) {
 }
 
 // --- registry -------------------------------------------------------------------
+/** Missing registry = no sleepers. Anything else unreadable is an error:
+ *  treating a corrupt file as empty would let the next update overwrite it
+ *  and silently drop every sleeper. */
 function readRegistry() {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(REGISTRY, "utf8"));
-  } catch {
-    return {};
+    raw = fs.readFileSync(REGISTRY, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw e;
   }
+  let reg;
+  try { reg = JSON.parse(raw); } catch {}
+  if (!reg || typeof reg !== "object" || Array.isArray(reg)) {
+    throw new Error(`${REGISTRY} is not a valid registry; leaving it untouched (fix or delete it)`);
+  }
+  return reg;
 }
 function writeRegistry(reg) {
   fs.mkdirSync(STATE_DIR, { recursive: true });

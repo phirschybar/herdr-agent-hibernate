@@ -203,6 +203,26 @@ test("resume drops the entry when a different agent kind now occupies the pane",
   assert.deepEqual(t.registry(), {});
 });
 
+test("a corrupt registry is reported and never overwritten", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  const file = path.join(t.env.HERDR_PLUGIN_STATE_DIR, "registry.json");
+  fs.mkdirSync(t.env.HERDR_PLUGIN_STATE_DIR, { recursive: true });
+  for (const junk of ["{not json", "null", "[]"]) {
+    fs.writeFileSync(file, junk);
+    for (const cmd of [["resume", "w1:p2"], ["list"], ["resume-all"]]) {
+      const r = t.run(...cmd);
+      assert.equal(r.status, 1, cmd.join(" "));
+      assert.match(r.stderr, /not a valid registry/);
+    }
+    assert.equal(fs.readFileSync(file, "utf8"), junk);
+  }
+  // Sleeping still stops the agent; the failure to record it names the session.
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /exited \(session sess-1\) but could not be recorded/);
+  assert.equal(fs.readFileSync(file, "utf8"), "[]");
+});
+
 test("sleep records the sleeper when herdr goes away after the signal but the pid is gone", async () => {
   const proc = fakeAgentProcess();
   await new Promise((r) => setTimeout(r, 200));
