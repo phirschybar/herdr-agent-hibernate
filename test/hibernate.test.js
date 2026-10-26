@@ -408,3 +408,79 @@ test("watcher drops entries whose pane id now belongs to another terminal", asyn
     stopWatcher(t);
   }
 });
+
+/** A key waiter as the slept pane would run it, with a pipe for its stdin. */
+function spawnWaiter(t, pane = "w1:p2") {
+  const c = spawn(process.execPath, [BIN, "wait-key", pane], { env: t.env, stdio: ["pipe", "pipe", "pipe"] });
+  children.push(c);
+  let out = "";
+  c.stdout.on("data", (d) => (out += d));
+  const exited = new Promise((r) => c.on("exit", (code) => r(code)));
+  return { c, out: () => out, exited };
+}
+
+test("sleep leaves a key waiter in the pane unless HIBERNATE_WAKE_ON_KEY=0", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })] });
+  assert.equal(t.run("sleep-pane", "w1:p2").status, 0);
+  const run = t.herdr().calls.find((c) => c[0] === "pane" && c[1] === "run");
+  assert.equal(run[2], "w1:p2");
+  assert.match(run[3], /^HERDR_PLUGIN_STATE_DIR='[^']+' HERDR_BIN_PATH='[^']+' '[^']+' '[^']+hibernate\.js' wait-key 'w1:p2'$/);
+  assert.equal(t.registry()["w1:p2"].kind, "codex");
+
+  const u = setup({ agents: [agent({ agent: "codex" })] }, { HIBERNATE_WAKE_ON_KEY: "0" });
+  assert.equal(u.run("sleep-pane", "w1:p2").status, 0);
+  assert.ok(!u.herdr().calls.some((c) => c[0] === "pane" && c[1] === "run"));
+});
+
+test("a failed waiter launch keeps the sleeper recorded", () => {
+  const t = setup({ agents: [agent({ agent: "codex" })], failPaneRun: true });
+  const r = t.run("sleep-pane", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(t.registry()["w1:p2"].session_id, "sess-1");
+  assert.match(fs.readFileSync(path.join(t.env.HERDR_PLUGIN_STATE_DIR, "watch.log"), "utf8"), /waiter not started in w1:p2/);
+});
+
+test("a key pressed at the waiter resumes the session", async () => {
+  const t = setup({ agents: [], panes: [{ pane_id: "w1:p2", terminal_id: "term_a" }] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "k1", terminal_id: "term_a", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid === w.c.pid), "waiter did not register");
+  assert.ok(await waitFor(() => /Press any key/.test(w.out())));
+  w.c.stdin.write("x");
+  assert.equal(await w.exited, 0);
+  assert.ok(await waitFor(() => (t.herdr().calls || []).some((c) => c[1] === "start")), "agent was not started");
+  assert.ok(await waitFor(() => !t.registry()["w1:p2"]));
+  assert.deepEqual(t.herdr().calls.find((c) => c[1] === "start").slice(-2), ["--resume", "k1"]);
+});
+
+test("Ctrl-C at the waiter leaves the sleeper for the resume action", async () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "claude", session_id: "k2", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid));
+  w.c.stdin.write("\x03");
+  assert.equal(await w.exited, 0);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!(t.herdr().calls || []).some((c) => c[1] === "start"));
+  assert.equal(t.registry()["w1:p2"].session_id, "k2");
+  assert.equal(t.registry()["w1:p2"].waiter_pid, undefined);
+});
+
+test("the waiter exits at once when the pane is not hibernated", async () => {
+  const t = setup({ agents: [] });
+  const w = spawnWaiter(t);
+  assert.equal(await w.exited, 0);
+  assert.equal(w.out(), "");
+});
+
+test("resume stops a live waiter before starting the agent", async () => {
+  const t = setup({ agents: [] });
+  t.writeRegistry({ "w1:p2": { kind: "opencode", session_id: "k3", slept_at: 1 } });
+  const w = spawnWaiter(t);
+  assert.ok(await waitFor(() => t.registry()["w1:p2"]?.waiter_pid));
+  const r = t.run("resume", "w1:p2");
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(await w.exited, 0);
+  assert.equal(t.herdr().calls.filter((c) => c[1] === "start").length, 1);
+  assert.deepEqual(t.registry(), {});
+});

@@ -10,6 +10,7 @@
 //   start:  "ok" | "not_ready" | "fail",           // agent start behaviour
 //   exitOnPrompt: true,                             // typed exit command works
 //   failGetsFrom: N,                                // `agent get` call N onward fails (server down)
+//   failPaneRun: true,                              // `pane run` (the key waiter) fails
 // }
 const fs = require("node:fs");
 
@@ -81,6 +82,7 @@ const res = withState((s) => {
     return ok({ process_info: { pane_id: pane, shell_pid: 1, foreground_process_group_id: a?.pid || 1, foreground_processes: procs } });
   }
   if (group === "pane" && cmd === "list") return ok({ panes: s.panes || [] });
+  if (group === "pane" && cmd === "run") return s.failPaneRun ? fail("pane_not_found") : ok({ type: "pane_ran" });
   return fail("unsupported_fake_call");
 });
 
