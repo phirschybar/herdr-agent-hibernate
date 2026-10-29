@@ -246,6 +246,107 @@ function normalizeAgent(a) {
  *  Bash call (foreground or background: polling loops, monitors, dev servers)
  *  as a shell that sources its shell snapshot, so any such descendant means
  *  "idle" on screen is NOT idle in fact — SIGTERM would kill that work. */
+/** homelab: background work that lives INSIDE the Claude process, which no
+ *  process-tree check can see: background subagents, Monitor watches, /loop
+ *  wake-ups (ScheduleWakeup) and session crons (CronCreate). All of it dies
+ *  with the process. Reads the session transcript and returns a description of
+ *  each item started by THIS process (anything older died with an earlier
+ *  process) that has not ended. Unreadable transcript -> refuse, never guess. */
+function claudePendingWork(sessionId, pid) {
+  const file = claudeTranscript(sessionId);
+  if (!file) return [`transcript for session ${sessionId} not found`];
+  const r = spawnSync("ps", ["-o", "etimes=", "-p", String(pid)], { encoding: "utf8" });
+  const age = Number((r.stdout || "").trim());
+  if (r.status !== 0 || !Number.isFinite(age)) return [`cannot read the start time of pid ${pid}`];
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch (e) { return [`cannot read ${file}: ${e.code}`]; }
+  return pendingWorkIn(text, Date.now() - age * 1000 - 5000, Date.now());
+}
+
+function claudeTranscript(sessionId) {
+  if (!sessionId || !/^[0-9a-f-]{36}$/i.test(sessionId)) return null;
+  const root = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || ".", ".claude"), "projects");
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch { return null; }
+  for (const d of dirs) {
+    const f = path.join(root, d, `${sessionId}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
+}
+
+/** Pure: transcript JSONL text -> unfinished background work started at or
+ *  after `sinceMs`. Exported for tests. */
+function pendingWorkIn(text, sinceMs, nowMs) {
+  const uses = new Map();     // tool_use id -> { name, input }
+  const tasks = new Map();    // task id -> { what, at }
+  const crons = new Map();    // cron id -> { kind, expr, at }
+  let wake = null;            // ms the last scheduled /loop wake-up fires
+  const resultText = (c) => typeof c === "string" ? c
+    : Array.isArray(c) ? c.map((x) => (typeof x === "string" ? x : x?.text || "")).join("\n") : "";
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    // A task-notification with a status ends that task, however it arrived
+    // (user message, queued input, attachment). Scan the raw line for it.
+    if (line.includes("<task-id>")) {
+      const re = /<task-id>([^<]+)<\/task-id>[\s\S]*?<status>([a-z_]+)<\/status>/g;
+      for (let m; (m = re.exec(line));) tasks.delete(m[1]);
+    }
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    const at = Date.parse(o.timestamp || "") || 0;
+    const content = o.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const c of content) {
+      if (c?.type === "tool_use") { uses.set(c.id, { name: c.name, input: c.input || {} }); continue; }
+      if (c?.type !== "tool_result") continue;
+      const use = uses.get(c.tool_use_id);
+      if (!use) continue;
+      const t = resultText(c.content);
+      if (use.name === "TaskStop" || use.name === "KillShell") {
+        tasks.delete(use.input.task_id || use.input.shell_id);
+        continue;
+      }
+      if (use.name === "CronDelete") { crons.delete(use.input.id); continue; }
+      if (at < sinceMs) continue; // started by an earlier, already-dead process
+      // Match each marker only in its own tool's result: a Bash result that
+      // merely PRINTS "Monitor started (task x" (grepping a transcript) is
+      // not a monitor.
+      let m;
+      if (use.name === "Bash" && (m = t.match(/^Command running in background with ID: ([\w-]+)/))) tasks.set(m[1], { what: "background command", at });
+      else if (use.name === "Agent" && (m = t.match(/agentId: ([\w-]+)/))) tasks.set(m[1], { what: "background agent", at });
+      else if (use.name === "Monitor" && (m = t.match(/^Monitor started \(task ([\w-]+)/))) tasks.set(m[1], { what: "monitor", at });
+      else if (use.name === "ScheduleWakeup") {
+        if (use.input.stop) wake = null;
+        else if ((m = t.match(/\(in (\d+)s\)/))) wake = at + Number(m[1]) * 1000;
+      } else if (use.name === "CronCreate" && (m = t.match(/Scheduled (one-shot|recurring) task ([\w-]+) \(([^)]+)\)/))) {
+        crons.set(m[2], { kind: m[1], expr: m[3], at });
+      }
+    }
+  }
+  const out = [];
+  const DAY = 86_400_000;
+  for (const [id, t] of tasks) {
+    // Monitors expire after 30 min on their own; anything else gets a day
+    // before we assume its end notice was lost.
+    const ttl = t.what === "monitor" ? 35 * 60_000 : DAY;
+    if (nowMs - t.at < ttl) out.push(`${t.what} ${id}`);
+  }
+  if (wake !== null && wake > nowMs - 60_000) out.push(`/loop wake-up at ${new Date(wake).toISOString()}`);
+  for (const [id, c] of crons) {
+    if (c.kind === "recurring") { out.push(`recurring cron ${id} (${c.expr})`); continue; }
+    // One-shot: "M H DoM Mon *" pinned to a date fires once; past it, it's gone.
+    const f = c.expr.trim().split(/\s+/);
+    const pinned = f.length === 5 && f.slice(0, 4).every((x) => /^\d+$/.test(x));
+    if (!pinned) { out.push(`one-shot cron ${id} (${c.expr})`); continue; }
+    const created = new Date(c.at);
+    let fire = new Date(created.getFullYear(), Number(f[3]) - 1, Number(f[2]), Number(f[1]), Number(f[0]));
+    if (fire.getTime() < c.at - 60_000) fire = new Date(fire.getFullYear() + 1, fire.getMonth(), fire.getDate(), fire.getHours(), fire.getMinutes());
+    if (fire.getTime() > nowMs - 5 * 60_000) out.push(`one-shot cron ${id} at ${fire.toISOString()}`);
+  }
+  return out;
+}
+
 function busyChildren(pid) {
   const r = spawnSync("ps", ["-A", "-o", "pid=,ppid=,args="], { encoding: "utf8" });
   if (r.status !== 0) return ["<ps failed>"]; // can't tell: refuse, don't guess
@@ -348,6 +449,12 @@ function sleepPane(paneId, { manual = false } = {}) {
     const busy = busyChildren(pid);
     if (busy.length) {
       throw new Error(`${paneId}: ${busy.length} background shell task(s) still running under pid ${pid} — not sleeping`);
+    }
+    if (norm.kind === "claude" && !/^(0|false|no|off)$/i.test(process.env.HIBERNATE_TRANSCRIPT_CHECK || "")) {
+      const pending = claudePendingWork(norm.session, pid);
+      if (pending.length) {
+        throw new Error(`${paneId}: background work pending (${pending.join("; ")}) — not sleeping`);
+      }
     }
     process.kill(pid, profile.exitSignal);
     how = `${profile.exitSignal} to pid ${pid}`;
@@ -831,4 +938,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { AGENT_PROFILES, entryKind, normalizeAgent, busyChildren };
+module.exports = { AGENT_PROFILES, entryKind, normalizeAgent, busyChildren, pendingWorkIn };

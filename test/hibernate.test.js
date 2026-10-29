@@ -28,6 +28,8 @@ function setup(state, extraEnv = {}) {
     FAKE_HERDR_STATE: stateFile,
     HERDR_PLUGIN_STATE_DIR: path.join(dir, "state"),
     HIBERNATE_EXIT_TIMEOUT_SECONDS: "1",
+    // fake claude agents have no transcript; pendingWorkIn has its own tests
+    HIBERNATE_TRANSCRIPT_CHECK: "0",
     ...extraEnv,
   };
   const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { env, encoding: "utf8" });
@@ -495,4 +497,43 @@ test("busyChildren finds Bash-tool shells under the agent, and nothing else", as
   await new Promise((r) => setTimeout(r, 200));
   assert.deepEqual(busyChildren(process.pid), [task.pid]);
   plain.kill(); task.kill();
+});
+
+// homelab: background work inside the Claude process, read from its transcript.
+test("pendingWorkIn: unfinished background work started by this process", () => {
+  const { pendingWorkIn } = require("../bin/hibernate.js");
+  const T0 = Date.parse("2026-10-29T10:00:00Z");
+  const iso = (ms) => new Date(ms).toISOString();
+  const use = (id, name, input, at) => JSON.stringify({ timestamp: iso(at), message: { content: [{ type: "tool_use", id, name, input }] } });
+  const res = (id, text, at) => JSON.stringify({ timestamp: iso(at), message: { content: [{ type: "tool_result", tool_use_id: id, content: text }] } });
+  const note = (task, status, at) => JSON.stringify({ timestamp: iso(at), message: { content: `<task-notification>\n<task-id>${task}</task-id>\n<status>${status}</status>\n</task-notification>` } });
+  const run = (lines, since = T0 - 1000, now = T0 + 60_000) => pendingWorkIn(lines.join("\n"), since, now);
+
+  // background command: pending until its notification; a TaskStop also ends it
+  assert.deepEqual(run([use("u1", "Bash", { run_in_background: true }, T0), res("u1", "Command running in background with ID: b1. Output…", T0)]), ["background command b1"]);
+  assert.deepEqual(run([use("u1", "Bash", {}, T0), res("u1", "Command running in background with ID: b1.", T0), note("b1", "completed", T0 + 5)]), []);
+  assert.deepEqual(run([use("u1", "Bash", {}, T0), res("u1", "Command running in background with ID: b1.", T0), use("u2", "TaskStop", { task_id: "b1" }, T0 + 5), res("u2", "stopped", T0 + 5)]), []);
+  // a Bash result that merely PRINTS a marker is not a task
+  assert.deepEqual(run([use("u1", "Bash", {}, T0), res("u1", "grep says: Monitor started (task zz, expires", T0)]), []);
+  // started before this process: already dead, ignored
+  assert.deepEqual(run([use("u1", "Agent", {}, T0 - 10_000), res("u1", "Async agent launched successfully.\nagentId: a1", T0 - 10_000)]), []);
+  assert.deepEqual(run([use("u1", "Agent", {}, T0), res("u1", "Async agent launched successfully.\nagentId: a1", T0)]), ["background agent a1"]);
+  // monitors expire on their own after 30 min
+  const mon = [use("u1", "Monitor", {}, T0), res("u1", "Monitor started (task m1, expires in 30m", T0)];
+  assert.deepEqual(run(mon), ["monitor m1"]);
+  assert.deepEqual(run(mon, T0 - 1000, T0 + 40 * 60_000), []);
+  // /loop wake-up pending until it fires; stop cancels
+  const wake = [use("u1", "ScheduleWakeup", { delaySeconds: 3600 }, T0), res("u1", "Next wakeup scheduled for 11:00:00 (in 3600s).", T0)];
+  assert.equal(run(wake).length, 1);
+  assert.deepEqual(run(wake, T0 - 1000, T0 + 2 * 3600_000), []);
+  assert.deepEqual(run([...wake, use("u2", "ScheduleWakeup", { stop: true }, T0 + 5), res("u2", "Loop stopped.", T0 + 5)]), []);
+  // crons: recurring always pending until deleted; a pinned one-shot until its time
+  const rec = [use("u1", "CronCreate", {}, T0), res("u1", "Scheduled recurring task c1 (*/5 * * * *). Session-only", T0)];
+  assert.deepEqual(run(rec), ["recurring cron c1 (*/5 * * * *)"]);
+  assert.deepEqual(run([...rec, use("u2", "CronDelete", { id: "c1" }, T0 + 5), res("u2", "deleted", T0 + 5)]), []);
+  const d = new Date(T0 + 3600_000);
+  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} ${d.getMonth() + 1} *`;
+  const one = [use("u1", "CronCreate", {}, T0), res("u1", `Scheduled one-shot task c2 (${expr}). Session-only`, T0)];
+  assert.equal(run(one).length, 1);
+  assert.deepEqual(run(one, T0 - 1000, T0 + 2 * 3600_000), []);
 });
