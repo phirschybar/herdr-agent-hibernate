@@ -46,6 +46,21 @@ const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
+// homelab: tunables from a file, so they can change without restarting the
+// Herdr server (whose environment the watcher otherwise inherits). Only
+// HIBERNATE_* keys, and real env vars still win. Default path:
+// ~/.config/herdr-agent-hibernate.env
+(function loadEnvFile() {
+  const file = process.env.HIBERNATE_ENV_FILE
+    || path.join(process.env.HOME || ".", ".config", "herdr-agent-hibernate.env");
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch { return; }
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*(HIBERNATE_[A-Z_]+)\s*=\s*(.*?)\s*$/);
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+  }
+})();
+
 const HERDR = process.env.HERDR_BIN_PATH || "herdr";
 // Single source of truth for state. Herdr injects HERDR_PLUGIN_STATE_DIR
 // (e.g. ~/.local/state/herdr/plugins/<id>) when running hooks/actions, but
@@ -223,7 +238,35 @@ function normalizeAgent(a) {
     seq: a.state_change_seq ?? null,
     session: a.agent_session?.value || null,
     focused: !!a.focused,
+    title: a.terminal_title_stripped || "",
   };
+}
+
+/** homelab: running Bash-tool commands under the agent. Claude Code runs every
+ *  Bash call (foreground or background: polling loops, monitors, dev servers)
+ *  as a shell that sources its shell snapshot, so any such descendant means
+ *  "idle" on screen is NOT idle in fact — SIGTERM would kill that work. */
+function busyChildren(pid) {
+  const r = spawnSync("ps", ["-A", "-o", "pid=,ppid=,args="], { encoding: "utf8" });
+  if (r.status !== 0) return ["<ps failed>"]; // can't tell: refuse, don't guess
+  const kids = new Map();
+  const args = new Map();
+  for (const line of r.stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const [p, pp] = [Number(m[1]), Number(m[2])];
+    args.set(p, m[3]);
+    if (!kids.has(pp)) kids.set(pp, []);
+    kids.get(pp).push(p);
+  }
+  const busy = [];
+  const stack = [...(kids.get(pid) || [])];
+  while (stack.length) {
+    const p = stack.pop();
+    if (/shell-snapshots\//.test(args.get(p) || "")) busy.push(p);
+    stack.push(...(kids.get(p) || []));
+  }
+  return busy;
 }
 
 // --- sleep ----------------------------------------------------------------------
@@ -240,6 +283,12 @@ function assertSleepable(paneId, { allowFocused = false } = {}) {
   }
   if (!HIBERNATABLE.includes(norm.kind)) {
     throw new Error(`${paneId}: agent kind "${norm.kind}" is not hibernatable`);
+  }
+  // homelab: the `claude agents` background-session list view reports as a
+  // claude agent, but it is not a conversation; resuming its id would not
+  // bring the list back.
+  if (/claude agents$/.test(norm.title)) {
+    throw new Error(`${paneId} is a "claude agents" list view, not a conversation`);
   }
   if (!norm.session) {
     throw new Error(`${paneId} has no native session reference yet — send it a message first, and make sure the integration is installed (herdr integration install ${norm.kind})`);
@@ -296,6 +345,10 @@ function sleepPane(paneId, { manual = false } = {}) {
   let pid = null;
   if (profile.exitSignal) {
     pid = agentPid(paneId, norm.kind);
+    const busy = busyChildren(pid);
+    if (busy.length) {
+      throw new Error(`${paneId}: ${busy.length} background shell task(s) still running under pid ${pid} — not sleeping`);
+    }
     process.kill(pid, profile.exitSignal);
     how = `${profile.exitSignal} to pid ${pid}`;
   } else {
@@ -778,4 +831,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { AGENT_PROFILES, entryKind, normalizeAgent };
+module.exports = { AGENT_PROFILES, entryKind, normalizeAgent, busyChildren };

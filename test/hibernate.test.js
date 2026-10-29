@@ -484,3 +484,15 @@ test("resume stops a live waiter before starting the agent", async () => {
   assert.equal(t.herdr().calls.filter((c) => c[1] === "start").length, 1);
   assert.deepEqual(t.registry(), {});
 });
+
+// homelab: an "idle" agent with a running Bash-tool command must not be slept.
+test("busyChildren finds Bash-tool shells under the agent, and nothing else", async () => {
+  const { spawn } = require("node:child_process");
+  const { busyChildren } = require("../bin/hibernate.js");
+  const plain = spawn("sleep", ["5"]);
+  assert.deepEqual(busyChildren(process.pid), [], "a plain child is not a Bash-tool task");
+  const task = spawn("bash", ["-c", "sleep 5; : /home/x/.claude/shell-snapshots/snapshot-bash-1.sh"]);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(busyChildren(process.pid), [task.pid]);
+  plain.kill(); task.kill();
+});
